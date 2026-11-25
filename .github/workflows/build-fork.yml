@@ -1,0 +1,169 @@
+name: build installer.pkg (fork, self-contained)
+
+# 全网页操作版：issue #207 修复已内嵌，构建时自动打补丁。
+# 使用：Run workflow → 填 version → 等待 → Releases 下载 FireInstaller.pkg
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "版本号 (如 v0.32.1-fscarmen)"
+        required: true
+        type: string
+      ref:
+        description: "分支 (默认 master)"
+        required: false
+        type: string
+        default: "master"
+      apply_issue207_fix:
+        description: "应用 issue #207 修复"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    env:
+      USE_CODE_SIGN: "disable"
+      NEXT_VERSION: ${{ inputs.version }}
+      BUILD_VERSION: ${{ inputs.version }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+          ref: ${{ inputs.ref }}
+
+      - name: apply issue #207 fix (SecureEventInput leak causes stuck-in-English)
+        if: ${{ inputs.apply_issue207_fix }}
+        run: |
+          cat > /tmp/fix207.patch <<'PATCH_EOF'
+          diff --git a/Fire/Engine/Engine.swift b/Fire/Engine/Engine.swift
+          index 3362e8f..0609cc6 100644
+          --- a/Fire/Engine/Engine.swift
+          +++ b/Fire/Engine/Engine.swift
+          @@ -28,11 +28,28 @@ class Engine {
+               var inputMode: InputMode {
+                   self.store.inputMode
+               }
+          +
+          +    /// 上次因安全输入(SecureEventInput)被强制切到英文的时间。
+          +    /// issue #207: IsSecureEventInputEnabled() 反映的是系统全局的安全输入状态，
+          +    /// 任意进程（密码管理器 / Electron 应用 / 网银控件等）开启后未释放（崩溃或 bug 泄漏）
+          +    /// 都会让该状态全局为 true，直到泄漏进程退出。此时 activateServer 会在每次
+          +    /// 触发时把输入模式强制切回英文，用户手动切换也被覆盖，表现为"怎么切都只出英文"。
+          +    /// 这里记录强制发生的时间，与 userToggledAt 比较来判断"本轮安全输入期间
+          +    /// 用户是否手动切回过中文"，以尊重用户意图并在安全输入消失后自愈。
+          +    var secureEventEnforcedAt = Date.distantPast
+          +    /// 用户最后一次手动切换中英文的时间（Shift / 菜单等无参 toggle 调用）。
+          +    var userToggledAt = Date.distantPast
+          +
+               func toggleInputMode(_ nextInputMode: InputMode? = nil) {
+                   if nextInputMode != nil, self.store.inputMode == nextInputMode {
+                       return
+                   }
+
+          +        // 无参调用 = 用户手动切换（Shift / 菜单），记录时间戳并解除安全输入强制标记
+          +        if nextInputMode == nil {
+          +            self.userToggledAt = Date()
+          +        }
+          +
+                   let oldVal = store.inputMode
+                   if let nextInputMode = nextInputMode, nextInputMode != store.inputMode {
+                       store.inputMode = nextInputMode
+          diff --git a/Fire/Engine/RootState.swift b/Fire/Engine/RootState.swift
+          index 42c4c75..075b8c5 100644
+          --- a/Fire/Engine/RootState.swift
+          +++ b/Fire/Engine/RootState.swift
+          @@ -231,6 +231,15 @@ class RootState: InputState {
+                   FireLog.input.debug("enModeHandler")
+                   // 英文输入模式, 不做任何处理
+                   if store.inputMode == .enUS {
+          +            // issue #207 自愈：当前英文模式是被安全输入(SecureEventInput)强制切换的，
+          +            // 且系统安全输入状态已消失（泄漏进程退出后无需注销即可恢复），
+          +            // 此时切回中文，并让本次按键继续按中文流程处理
+          +            if engine.secureEventEnforcedAt > engine.userToggledAt,
+          +               !IsSecureEventInputEnabled() {
+          +                FireLog.input.info("secure event ended, restore zhhans (issue #207)")
+          +                engine.toggleInputMode(.zhhans)
+          +                return nil
+          +            }
+                       return false
+                   }
+                   return nil
+          diff --git a/Fire/FireInputServer.swift b/Fire/FireInputServer.swift
+          index 72ffd50..496ec26 100644
+          --- a/Fire/FireInputServer.swift
+          +++ b/Fire/FireInputServer.swift
+          @@ -58,11 +58,28 @@ extension FireInputController {
+                        * 一般情况下系统会自动切换到 ABC 输入法，在输入过程中不会调用第三方输入法
+                        * 但在删除系统 ABC 输入法的情况下，仍然有可能会调用到第三方输入法 https://github.com/qwertyyb/Fire/issues/158
+                        * 在这种情况下，输入法需要切换到英文模式，避免影响用户输入密码
+          +             *
+          +             * issue #207: IsSecureEventInputEnabled() 反映系统全局状态，任意进程
+          +             * 泄漏该状态（开启后未释放）时，此处会在每次 activateServer 强制切回英文，
+          +             * 用户手动切换被反复覆盖，表现为"怎么切都只出英文"，注销才恢复。
+          +             * 修复：若用户在本轮安全输入期间已手动切回过中文，则尊重用户意图不再强制；
+          +             * 强制发生时记录时间戳，供安全输入消失后自愈（见下方 else 分支与 enModeHandler）。
+                        */
+          +            if Fire.engine.userToggledAt > Fire.engine.secureEventEnforcedAt {
+          +                FireLog.input.info("secure event active, but user manually toggled — keep current mode")
+          +                return
+          +            }
+          +            Fire.engine.secureEventEnforcedAt = Date()
+                       Fire.engine.toggleInputMode(.enUS)
+                       return
+                   }
+
+          +        // 安全输入已结束：若此前是被安全输入强制切到英文的（且用户未手动切换过），
+          +        // 自愈恢复为中文，避免泄漏进程退出后仍卡在英文模式（issue #207）
+          +        if Fire.engine.secureEventEnforcedAt > Fire.engine.userToggledAt {
+          +            Fire.engine.toggleInputMode(.zhhans)
+          +        }
+          +
+                   let changed = restoreCurrentClientInputMode()
+
+                   if (changed && Defaults[.appInputModeTipShowTime] != .none) || Defaults[.appInputModeTipShowTime] == .always {
+          PATCH_EOF
+          git apply /tmp/fix207.patch
+          echo "=== applied ==="
+          git diff --stat
+
+      - name: prepare sqlcipher
+        run: ./scripts/0_prepare_sqlcipher.sh
+
+      - name: build Fire.app (unsigned)
+        run: ./scripts/a_build_app.sh
+
+      - name: build FireInstaller.pkg (unsigned)
+        run: ./scripts/b_build_installer.sh
+
+      - name: gather artifacts
+        run: |
+          mkdir -p ./dist-out
+          cp ./dist/FireInstaller.pkg ./dist-out/
+          cp ./Fire/Info.plist ./dist-out/Info.plist
+          ls -la ./dist-out/
+
+      - name: upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FireInstaller-${{ inputs.version }}-unsigned
+          path: ./dist-out/
+          retention-days: 30
+
+      - name: create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.version }}
+          name: Fire ${{ inputs.version }} (fork build, unsigned)
+          body: |
+            自编译版本：包含 issue #207 修复（SecureEventInput 系统级泄漏导致永久卡英文）。
+            无签名无公证，安装后如被 Gatekeeper 拦截：
+            `sudo xattr -d -r com.apple.quarantine "/Library/Input Methods/Fire.app"`
+          files: |
+            ./dist-out/FireInstaller.pkg
