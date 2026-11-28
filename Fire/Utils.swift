@@ -12,15 +12,26 @@ import InputMethodKit
 import SwiftUI
 
 class Utils {
-    // 以下四个正则提为 static let，避免 shouldConcatWithWhitespace 在每次按键时重复编译正则表达式
-    // enDigitSuffix: 判断上次输入以英文或数字结尾
-    private static let enDigitSuffix = try! NSRegularExpression(pattern: "[a-zA-Z0-9]$")
-    // cnPrefix: 判断本次输入以中文开头
-    private static let cnPrefix = try! NSRegularExpression(pattern: "^[\\u4e00-\\u9fa5]")
-    // cnSuffix: 判断上次输入以中文结尾
-    private static let cnSuffix = try! NSRegularExpression(pattern: "[\\u4e00-\\u9fa5]$")
-    // enDigitPrefix: 判断本次输入以英文或数字开头
-    private static let enDigitPrefix = try! NSRegularExpression(pattern: "^[a-zA-Z0-9]")
+    // 中英文边界判断原本用四个 NSRegularExpression 做 numberOfMatches，
+    // 每次上屏都要在 UTF-16 上跑正则；这里改成标量比较，语义完全一致且零分配。
+    @inline(__always)
+    private static func isAsciiAlnum(_ scalar: Unicode.Scalar) -> Bool {
+        let v = scalar.value
+        return (v >= 48 && v <= 57) || (v >= 65 && v <= 90) || (v >= 97 && v <= 122)
+    }
+
+    @inline(__always)
+    private static func isCjk(_ scalar: Unicode.Scalar) -> Bool {
+        let v = scalar.value
+        return v >= 0x4e00 && v <= 0x9fa5
+    }
+
+    /// 上屏文本是否**可能**触发中英文边界加空格。
+    /// 标点、emoji 等直接返回 false，调用方因此可以跳过取前文的 IPC。
+    static func mayNeedWhitespace(before text: String) -> Bool {
+        guard let first = text.unicodeScalars.first else { return false }
+        return isCjk(first) || isAsciiAlnum(first)
+    }
 
     var toast: ToastWindowProtocol?
 
@@ -80,16 +91,10 @@ class Utils {
         if lastText.isEmpty || nextText.isEmpty {
             return false
         }
-        let firstEnReg = Utils.enDigitSuffix
-        let nextCnReg = Utils.cnPrefix
-        if firstEnReg.numberOfMatches(in: lastText, range: NSRange(location: 0, length: lastText.utf16.count)) > 0
-            && nextCnReg.numberOfMatches(in: nextText, range: NSRange(location: 0, length: nextText.utf16.count)) > 0 {
-            return true
-        }
-        let firstCnReg = Utils.cnSuffix
-        let nextEnReg = Utils.enDigitPrefix
-        return firstCnReg.numberOfMatches(in: lastText, range: NSRange(location: 0, length: lastText.utf16.count)) > 0
-            && nextEnReg.numberOfMatches(in: nextText, range: NSRange(location: 0, length: nextText.utf16.count)) > 0
+        guard let last = lastText.unicodeScalars.last,
+              let next = nextText.unicodeScalars.first else { return false }
+        if Utils.isAsciiAlnum(last) && Utils.isCjk(next) { return true }
+        return Utils.isCjk(last) && Utils.isAsciiAlnum(next)
     }
 
     static let shared = Utils()

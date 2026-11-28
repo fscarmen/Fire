@@ -10,6 +10,45 @@ import SwiftUI
 import Defaults
 import AppKit
 
+// MARK: - 文本宽度缓存
+//
+// 横向候选排版会对每个候选词做 NSString.size(withAttributes:)（最坏还要二分
+// 查找最长前缀），每次 SwiftUI body 重算都要重复测量同样的字符串和字号。
+// 在主线程缓存测量结果；key 含字体名与字号，改主题不会读到旧值。
+
+private enum CandidateTextMetrics {
+    static var widths: [String: CGFloat] = [:]
+    static var fonts: [Int: NSFont] = [:]
+    private static var radicalFonts: [Int: NSFont] = [:]
+    private static let widthLimit = 4096
+
+    static func font(ofSize size: CGFloat) -> NSFont {
+        let key = Int((size * 4).rounded())
+        if let cached = fonts[key] { return cached }
+        let font = NSFont.systemFont(ofSize: size)
+        if fonts.count > 64 { fonts.removeAll(keepingCapacity: true) }
+        fonts[key] = font
+        return font
+    }
+
+    static func width(_ text: String, font: NSFont) -> CGFloat {
+        let key = "\(font.fontName)|\(font.pointSize)|\(text)"
+        if let cached = widths[key] { return cached }
+        let value = ceil((text as NSString).size(withAttributes: [.font: font]).width)
+        if widths.count >= widthLimit { widths.removeAll(keepingCapacity: true) }
+        widths[key] = value
+        return value
+    }
+
+    static func radicalFont(size: CGFloat) -> NSFont {
+        let key = Int((size * 4).rounded())
+        if let cached = radicalFonts[key] { return cached }
+        let font = NSFont(name: RadicalFontManager.fontName, size: size) ?? font(ofSize: size)
+        radicalFonts[key] = font
+        return font
+    }
+}
+
 // MARK: - 自定义毛玻璃背景（替代内置 .glassEffect()，实现圆角完全可控）
 
 struct GlassEffectView: NSViewRepresentable {
@@ -102,6 +141,8 @@ struct CandidateView: View {
         let codeColor = selected
             ? effectiveConfig.selectedCodeColor
             : effectiveConfig.candidateCodeColor
+        // 原来 wubiCode 提示模式下 getShownCode 被调用两次（判空 + 渲染）
+        let shownCode = hintMode == .wubiCode ? getShownCode(candidate: candidate, origin: origin) : ""
 
         return HStack(alignment: labelWidth == nil ? .center : .firstTextBaseline, spacing: 2) {
             if indexVisible {
@@ -120,8 +161,8 @@ struct CandidateView: View {
                     .font(Font.custom(RadicalFontManager.fontName, size: 12))
                     .foregroundStyle(Color(codeColor))
             }
-            if hintMode == .wubiCode && !getShownCode(candidate: candidate, origin: origin).isEmpty {
-                Text(getShownCode(candidate: candidate, origin: origin))
+            if hintMode == .wubiCode && !shownCode.isEmpty {
+                Text(shownCode)
                     .font(.system(size: CGFloat(effectiveConfig.codeFontSize)))
                     .foregroundStyle(Color(codeColor))
             }
@@ -224,7 +265,7 @@ struct CandidatesView: View {
     }
 
     private func measuredWidth(_ text: String, font: NSFont) -> CGFloat {
-        ceil((text as NSString).size(withAttributes: [.font: font]).width)
+        CandidateTextMetrics.width(text, font: font)
     }
 
     private func hintWidth(for candidate: Candidate) -> CGFloat {
@@ -233,7 +274,7 @@ struct CandidatesView: View {
             return 0
         case .spelling:
             guard let spelling = candidate.spelling, !spelling.isEmpty else { return 0 }
-            let font = NSFont(name: RadicalFontManager.fontName, size: 12) ?? .systemFont(ofSize: 12)
+            let font = CandidateTextMetrics.radicalFont(size: 12)
             return measuredWidth(spelling, font: font)
         case .wubiCode:
             let code = getShownCode(candidate: candidate, origin: origin)
@@ -247,7 +288,7 @@ struct CandidatesView: View {
 
     /// 序号、提示和内边距之外，留给候选词本身的宽度。超出时返回换行宽度。
     private func labelWidth(index: Int, candidate: Candidate) -> CGFloat? {
-        let font = NSFont.systemFont(ofSize: CGFloat(effectiveConfig.fontSize))
+        let font = CandidateTextMetrics.font(ofSize: CGFloat(effectiveConfig.fontSize))
         let natural = measuredWidth(candidate.label, font: font)
         var chrome = CGFloat(effectiveConfig.candidatePaddingLeft + effectiveConfig.candidatePaddingRight)
         var parts = 1
@@ -283,7 +324,7 @@ struct CandidatesView: View {
     private func hintFont() -> NSFont {
         switch hintMode {
         case .spelling:
-            return NSFont(name: RadicalFontManager.fontName, size: 12) ?? .systemFont(ofSize: 12)
+            return CandidateTextMetrics.radicalFont(size: 12)
         case .wubiCode:
             return .systemFont(ofSize: CGFloat(effectiveConfig.codeFontSize))
         case .pinyin, .none:

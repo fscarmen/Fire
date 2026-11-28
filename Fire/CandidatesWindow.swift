@@ -19,6 +19,20 @@ class CandidatesWindow: NSPanel, NSWindowDelegate {
     private var globalMonitor: Any?
     /// 刷新候选时忽略紧随的悬停事件，防止 SwiftUI 异步触发覆盖复位值
     private var refreshing = false
+    /// 合并「刷新保护期」的复位任务：原来每次按键都会排一个 0.2s 的 asyncAfter，
+    /// 快速输入时同时间存在几十个任务，这里只保留最后一个。
+    private var refreshResetTask: DispatchWorkItem?
+
+    private func armRefreshGuard() {
+        refreshing = true
+        refreshResetTask?.cancel()
+        let task = DispatchWorkItem { [weak self] in
+            self?.refreshing = false
+            self?.refreshResetTask = nil
+        }
+        refreshResetTask = task
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2, execute: task)
+    }
 
     /// 防止鼠标点击候选窗时切换焦点到正在输入的APP（NSPanel + nonactivatingPanel）
     override var canBecomeKey: Bool { false }
@@ -46,7 +60,7 @@ class CandidatesWindow: NSPanel, NSWindowDelegate {
     }
     
     func setState(original: String?, candidatesData: CandidatesData?, selectedIndex: Int?) {
-        refreshing = true
+        armRefreshGuard()
         if let candidatesData = candidatesData {
             hostingView.rootView.candidates = candidatesData.list
             hostingView.rootView.hasNext = candidatesData.hasNext
@@ -62,9 +76,6 @@ class CandidatesWindow: NSPanel, NSWindowDelegate {
             guard let self = self, !self.refreshing else { return }
             self.hostingView.rootView.selectedIndex = index
             self.inputController?.selectedIndex = index
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
-            self?.refreshing = false
         }
     }
 
@@ -86,7 +97,7 @@ class CandidatesWindow: NSPanel, NSWindowDelegate {
             orderFrontRegardless()
             return
         }
-        refreshing = true
+        armRefreshGuard()
         hostingView.rootView.candidates = candidatesData.list
         hostingView.rootView.origin = originalString
         hostingView.rootView.hasNext = candidatesData.hasNext
@@ -97,12 +108,24 @@ class CandidatesWindow: NSPanel, NSWindowDelegate {
             self.hostingView.rootView.selectedIndex = index
             self.inputController?.selectedIndex = index
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
-            self?.refreshing = false
-        }
         placeAtClampedTopLeft(topLeft)
         self.orderFrontRegardless()
 //        NSApp.setActivationPolicy(.prohibited)
+    }
+
+    /// 内容 + 选中项都未变时只把窗口置前。
+    /// 返回 true 表示调用方不必再查光标坐标（那是一次 IPC）。
+    @discardableResult
+    func isUnchanged(_ candidatesData: CandidatesData, originalString: String, selectedIndex: Int) -> Bool {
+        guard isVisible else { return false }
+        let root = hostingView.rootView
+        guard root.origin == originalString,
+              root.candidates == candidatesData.list,
+              root.hasNext == candidatesData.hasNext,
+              root.hasPrev == candidatesData.hasPrev,
+              root.selectedIndex == selectedIndex else { return false }
+        orderFrontRegardless()
+        return true
     }
 
     /// 候选列表、输入码和翻页状态都未变，仅选中下标可能变化

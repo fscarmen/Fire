@@ -22,9 +22,18 @@ class FireInputController: IMKInputController, InputContext  {
     var hasNext: Bool = true
     
     var selectedIndex: Int = 0
-    
+
     var session = Fire.shared.createSession()
-    
+
+    /// 上一次发给 client 的 markedText 内容。内容未变时跳过 setMarkedText，
+    /// 避免每次按键/上屏都跨进程调用客户端（Chrome / Electron 下尤其明显）。
+    /// 新客户端激活时由 activateServer 重置。
+    var lastMarkedTextValue: String? = nil
+
+    func resetMarkedTextState() {
+        lastMarkedTextValue = nil
+    }
+
     func commit(_ text: String) {
         FireLog.input.debug("commit: \(text)")
         self.insertText(text)
@@ -76,10 +85,14 @@ class FireInputController: IMKInputController, InputContext  {
         if Defaults[.showCodeInWindow] {
             selected = self.origin.count > 0 ? " " : ""
         }
+        // 组字区内容没变就不重复 setMarkedText：这是一次跨进程 IPC，
+        // 原来每次按键（含纯候选选择、提交后清理）都会发一次。
+        if selected == lastMarkedTextValue { return }
         let attrs = mark(forStyle: kTSMHiliteConvertedText, at: NSRange(location: NSNotFound, length: selected.count))  as? [NSAttributedString.Key: Any]
         if let attrs = attrs {
             let text = NSAttributedString(string: selected, attributes: attrs)
             client()?.setMarkedText(text, selectionRange: selectionRange(), replacementRange: replacementRange())
+            lastMarkedTextValue = selected
         }
     }
 
@@ -109,7 +122,9 @@ class FireInputController: IMKInputController, InputContext  {
     override func handle(_ event: NSEvent!, client sender: Any!) -> Bool {
         guard let event = event else { return false }
         
-        FireLog.input.debug("handle: \(event.debugDescription, privacy: .public)")
+        // 原来每次按键都用 event.debugDescription 拼日志字符串，即使日志关闭也会
+        // 生成一长串描述；改为只取廉价字段。
+        FireLog.input.debug("handle: \(String(describing: event.type), privacy: .public) keyCode=\(event.keyCode, privacy: .public)")
 
         // 在activateServer中有把IMKInputController绑定给CandidatesWindow
         // 然而在实际运行中发现，在Safari地址栏输入部分原码后，再按shift切到英文输入模式下时，候选窗消失了，但原码没有上屏
@@ -161,6 +176,11 @@ class FireInputController: IMKInputController, InputContext  {
             return
         }
         let candidatesData = (list: candidates, hasPrev: curPage > 1, hasNext: hasNext)
+        // 内容完全没变（例如只切换选中项）时不要再向客户端查光标坐标，
+        // getOriginPoint() 是一次 attributes(forCharacterIndex:) IPC。
+        if CandidatesWindow.shared.isUnchanged(candidatesData, originalString: origin, selectedIndex: selectedIndex) {
+            return
+        }
         CandidatesWindow.shared.setCandidates(
             candidatesData,
             originalString: origin,
@@ -178,14 +198,18 @@ class FireInputController: IMKInputController, InputContext  {
     }
 
     func insertCandidate(_ candidate: Candidate, confirmed: Bool = false) {
-        // 获取光标位置（参考 TipsWindow 定位方式）
-        let cursorPoint = getOriginPoint()
+        let effect = Defaults[.celebrationEffect]
+        let showCelebration = candidate.type != .placeholder
+            && effect != .none
+            && candidate.text.contains(where: { $0.isChineseChar })
+        // 原来无条件 getOriginPoint()：庆祝动画默认关闭，却每次上屏都做一次 IPC。
+        let cursorPoint = showCelebration ? getOriginPoint() : nil
 
         insertText(candidate.text)
 
         // 中文上屏时触发庆祝动画
-        if candidate.type != .placeholder, candidate.text.contains(where: { $0.isChineseChar }) {
-            Defaults[.celebrationEffect].show(at: cursorPoint)
+        if let cursorPoint = cursorPoint {
+            effect.show(at: cursorPoint)
         }
 
         let notification = Notification(
@@ -199,27 +223,55 @@ class FireInputController: IMKInputController, InputContext  {
 
     // 往输入框插入当前字符
     func insertText(_ text: String) {
-        FireLog.input.debug("insertText: \(text), \(self.client()?.bundleIdentifier() ?? "")")
-        if text.count > 0 {
-            var newText = text
-            let textBefore = getTextBefore(1)
-            if Defaults[.enableWhitespaceBetweenZhEn] && Utils.shared.shouldConcatWithWhitespace(textBefore, text) {
+        FireLog.input.debug("insertText: \(text, privacy: .public)")
+        guard !text.isEmpty else {
+            clean()
+            return
+        }
+
+        var newText = text
+        // 只有本次上屏确实可能在边界加空格时才查询前文。
+        // 标点/符号上屏不可能加空格，原来却无条件 getTextBefore(1)。
+        let needsWhitespaceCheck = Defaults[.enableWhitespaceBetweenZhEn]
+            && Utils.mayNeedWhitespace(before: text)
+        // 成对标点上屏需要知道原光标位置；与空格检查共用一次 getCursorOffset()，
+        // 原来这里会重复查两次（getTextBefore 内部一次，本处再一次）。
+        let mayBePair = Defaults[.enablePunctuationAutoPair] && Engine.isPair(text)
+        let cursor = (needsWhitespaceCheck || mayBePair) ? getCursorOffset() : -1
+        if needsWhitespaceCheck, cursor > 0 {
+            let textBefore = client()?.attributedSubstring(
+                from: NSMakeRange(cursor - 1, 1)
+            )?.string ?? ""
+            if Utils.shared.shouldConcatWithWhitespace(textBefore, newText) {
                 newText = " " + newText
-                FireLog.input.debug("insertCandidate should append whitespace: \(newText)")
-            }
-            let value = NSAttributedString(string: newText)
-            FireLog.input.debug("insertText before, \(String(describing: self.client()?.selectedRange())), \(String(describing: self.client()?.markedRange()))")
-            let cursor = getCursorOffset()
-            client()?.insertText(value, replacementRange: replacementRange())
-            if Engine.isPair(newText) {
-                Utils.retryUntil(interval: 0.1, timeout: 0.3) {
-                    guard cursor < self.getCursorOffset() else { return false }
-                    self.moveCursor(-1)
-                    return true
-                }
+                FireLog.input.debug("insertCandidate should append whitespace: \(newText, privacy: .public)")
             }
         }
+
+        let value = NSAttributedString(string: newText)
+        client()?.insertText(value, replacementRange: replacementRange())
         clean()
+
+        // 成对标点：原来固定等 100ms 才第一次轮询、最长 300ms（连续打标点有明显顿挫）。
+        // 现在先同步试一次，客户端已更新立即移回；否则 10ms 粒度重试、120ms 封顶。
+        if mayBePair, cursor >= 0, Engine.isPair(newText) {
+            moveCaretBackAfterPair(from: cursor)
+        }
+    }
+
+    /// 成对标点插入后把光标移回两个符号之间。
+    private func moveCaretBackAfterPair(from cursor: Int) {
+        let deadline = Date().addingTimeInterval(0.12)
+        func attempt() {
+            guard self.getCursorOffset() > cursor else {
+                if Date() < deadline {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.01, execute: attempt)
+                }
+                return
+            }
+            self.moveCursor(-1)
+        }
+        attempt()
     }
     // 光标位置，不考虑组字区
     func getCursorOffset() -> Int {
@@ -248,7 +300,9 @@ class FireInputController: IMKInputController, InputContext  {
     func moveCursor(_ offset: Int) {
         // offset 负值往前移，正值往后移
         guard let client = client() else { return }
-        FireLog.input.debug("moveCursor \(String(describing: client.attributedSubstring(from: NSMakeRange(0, 10)))) \(offset, privacy: .public), selectedRange: \(String(describing: client.selectedRange()), privacy: .public), markedRange: \(String(describing: client.markedRange()), privacy: .public), length: \(client.length(), privacy: .public)")
+        // 原来这一行调试日志会顺带调用 attributedSubstring/selectedRange/
+        // markedRange/length 四次客户端 IPC，即使日志级别未开启也会执行。
+        FireLog.input.debug("moveCursor \(offset, privacy: .public)")
         let attrs = mark(forStyle: kTSMHiliteConvertedText, at: NSRange(location: NSNotFound, length: 0))
         let curPos = client.selectedRange().location
         let expectPos = curPos + offset

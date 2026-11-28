@@ -30,7 +30,6 @@ class RootState: InputState {
         self.punctuationHandler = PunctuationHandler(transformer: punctuationTransformer)
     }
 
-    private static let letterRegex = try! NSRegularExpression(pattern: "^[a-zA-Z]+$")
     
     var subState: (any InputState)?
     
@@ -195,8 +194,10 @@ class RootState: InputState {
             let inputMode = store.inputMode
             FireLog.input.info("toggle mode: \(String(describing: inputMode), privacy: .public)")
 
-            // 把当前未上屏的原始code上屏处理
-            commitText(&context, context.origin)
+            // 把当前未上屏的原始code上屏处理（原码为空时不必走提交/清理链）
+            if !context.origin.isEmpty {
+                commitText(&context, context.origin)
+            }
             setSubState(nil, context: &context)
 
             engine.toggleInputMode()
@@ -214,7 +215,7 @@ class RootState: InputState {
         //   - Shift+字母由 charKeyHandler 处理(commit 0b51393 起，大写字母会被附加到原码而不直接上屏)
         // .deviceIndependentFlagsMask 用来过滤低位"设备相关"标志，避免极少数键盘场景下的脏数据误判。
         // 关联 issue #149 #152，回归源 commit 2d66064。
-        FireLog.input.info("flagChangeHandler, modifiers: \(String(describing: event.modifiers))")
+        FireLog.input.debug("flagChangeHandler, modifiers: \(String(describing: event.modifiers))")
         let modifiers = event.modifiers
             .subtracting([.shift, .capsLock])
         if event.type == .flagsChanged || (
@@ -231,6 +232,15 @@ class RootState: InputState {
         FireLog.input.debug("enModeHandler")
         // 英文输入模式, 不做任何处理
         if store.inputMode == .enUS {
+            // issue #207 自愈：当前英文模式是被安全输入(SecureEventInput)强制切换的，
+            // 且系统安全输入状态已消失（泄漏进程退出后无需注销即可恢复），
+            // 此时切回中文，并让本次按键继续按中文流程处理
+            if engine.secureEventEnforcedAt > engine.userToggledAt,
+               !IsSecureEventInputEnabled() {
+                FireLog.input.info("secure event ended, restore zhhans (issue #207)")
+                engine.toggleInputMode(.zhhans)
+                return nil
+            }
             return false
         }
         return nil
@@ -278,23 +288,23 @@ class RootState: InputState {
     }
     
     private func predictorHandler(_ event: KeyInput, context: inout any InputContext) -> Bool? {
-        // 在数字后输入。号自动转换为小数点
+        // 原来**每次按键**都先调用 getTextBefore(1)（一次 selectedRange/markedRange
+        // + attributedSubstring 的跨进程 IPC），哪怕这个键跟小数点/冒号毫无关系。
+        // 先按开关和 keyCode 过滤，只有真正需要时才读前文。
+        let wantsDot = config.enableDotAfterNumber && event.keyCode == kVK_ANSI_Period
+        let wantsColon = config.enableColonAfterNumber && event.keyCode == kVK_ANSI_Semicolon
+        guard wantsDot || wantsColon else { return nil }
+
         let textBefore = context.getTextBefore(1)
-        if textBefore.isEmpty || Int(textBefore) == nil {
-            return nil
-        }
-        
-        if config.enableDotAfterNumber && event.keyCode == kVK_ANSI_Period {
+        guard let scalar = textBefore.unicodeScalars.last,
+              scalar.value >= 48, scalar.value <= 57 else { return nil }
+
+        if wantsDot {
             context.commit(".")
             return true
         }
-        // 在数字后输入“：”，自动转为英文半角冒号
-        if config.enableColonAfterNumber && event.keyCode == kVK_ANSI_Semicolon {
-            context.commit(":")
-            return true
-        }
-
-        return nil
+        context.commit(":")
+        return true
     }
 
     private func deleteKeyHandler(_ event: KeyInput, context: inout any InputContext) -> Bool? {
@@ -324,23 +334,23 @@ class RootState: InputState {
         return nil
     }
     
+    @inline(__always)
+    private static func isAsciiLetter(_ byte: UInt8) -> Bool {
+        (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122)
+    }
+
     private func charKeyHandler(_ event: KeyInput, context: inout any InputContext) -> Bool? {
         // 获取输入的字符
         guard let string = event.characters else { return nil }
 
-        // 使用预编译的 static let 正则匹配，避免每次按键创建 NSRegularExpression 实例
-        let match = Self.letterRegex.firstMatch(
-            in: string,
-            options: [],
-            range: NSRange(location: 0, length: string.utf16.count)
-        )
-        
-        if match == nil {
-            return nil
-        }
+        // 原实现每次字母键都跑一次 NSRegularExpression.firstMatch。
+        // 编码只有 ASCII a-z/A-Z，直接按 UTF-8 字节判断，省掉正则引擎开销。
+        let bytes = Array(string.utf8)
+        guard !bytes.isEmpty, bytes.allSatisfy({ Self.isAsciiLetter($0) }) else { return nil }
+        let isUppercase = bytes.allSatisfy { $0 >= 65 && $0 <= 90 }
 
         // 输入大写字母，则自动 commit 首个候选词
-        if string >= "A" && string <= "Z" {
+        if isUppercase {
             if let first = context.candidates.first, first.type != .placeholder {
                 commitSelected(&context, reason: .auto)
             }
@@ -458,32 +468,36 @@ class RootState: InputState {
         }
     }
     
+    /// handler 链提为静态常量。原来每次按键都在栈上创建一个 18 元素的方法数组，
+    /// 每个元素还要捕获 self；高频输入下这些临时对象都是实打实的分配。
+    private static let codingHandlers: [(RootState, KeyInput, inout any InputContext) -> Bool?] = [
+        { $0.subStateHandler($1, context: &$2) },
+
+        { $0.enterTempEnHandler($1, context: &$2) },
+        { $0.enterDeleteCandidateHandler($1, context: &$2) },
+        { $0.enterQuickCombineHandler($1, context: &$2) },
+        { $0.pinCandidateHandler($1, context: &$2) },
+
+        { $0.flagsChangeHandler($1, context: &$2) },
+        { $0.enModeHandler($1, context: &$2) },
+
+        { $0.pageKeyHandler($1, context: &$2) },
+        { $0.predictorHandler($1, context: &$2) },
+        { $0.deleteKeyHandler($1, context: &$2) },
+        { $0.zRepetKeyHandler($1, context: &$2) },
+        { $0.charKeyHandler($1, context: &$2) },
+        { $0.numberKeyHandler($1, context: &$2) },
+        { $0.extraCandidateKeyHandler($1, context: &$2) },
+        { $0.escKeyHandler($1, context: &$2) },
+        { $0.enterKeyHandler($1, context: &$2) },
+        { $0.spaceKeyHandler($1, context: &$2) },
+        // 需要放在 extraCandidateKeyHandler 后面
+        { $0.punctuationKeyHandler(event: $1, context: &$2) },
+    ]
+
     func handle(_ event: KeyInput, context: inout any InputContext) -> HandleResult {
-        let codingHandlers = [
-            subStateHandler,
-            
-            enterTempEnHandler,
-            enterDeleteCandidateHandler,
-            enterQuickCombineHandler,
-            pinCandidateHandler,
-            
-            flagsChangeHandler,
-            enModeHandler,
-            
-            pageKeyHandler,
-            predictorHandler,
-            deleteKeyHandler,
-            zRepetKeyHandler,
-            charKeyHandler,
-            numberKeyHandler,
-            extraCandidateKeyHandler,
-            escKeyHandler,
-            enterKeyHandler,
-            spaceKeyHandler,
-            punctuationKeyHandler, // 需要放在 extraCandidateKeyHandler 后面
-        ]
-        for handler in codingHandlers {
-            if let result = handler(event, &context) {
+        for handler in Self.codingHandlers {
+            if let result = handler(self, event, &context) {
                 return .stay(result)
             }
         }

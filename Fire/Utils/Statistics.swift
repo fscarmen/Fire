@@ -28,7 +28,13 @@ class Statistics {
         FireLog.statistics.info("init")
         NotificationCenter.default
             .addObserver(self, selector: #selector(listener), name: Fire.candidateInserted, object: nil)
-        initDB()
+        // 统计关闭时完全不打开加密库、不读钥匙串：原来即使关掉统计，
+        // 进程启动仍会读 Keychain 里的 dbkey 并触发系统授权弹窗。
+        if Defaults[.enableStatistics] { initDB() }
+        Defaults.observe(keys: .enableStatistics) { [weak self] in
+            guard let self = self else { return }
+            if Defaults[.enableStatistics] { self.initDB() }
+        }.tieToLifetime(of: self)
     }
 
     // 日期格式化器提为 static let，避免每次候选上屏时创建 DateFormatter 实例（性能优化）
@@ -236,7 +242,10 @@ class Statistics {
         return setVersion(Int32(upgrade.count))
     }
 
+    private var dbInitialized = false
+
     private func initDB() {
+        guard !dbInitialized else { return }
         // 安全获取目录路径，避免 first! 崩溃
         let dirPath: String = {
             let dirs = NSSearchPathForDirectoriesInDomains(.applicationSupportDirectory, .userDomainMask, true)
@@ -264,6 +273,7 @@ class Statistics {
             ) == SQLITE_OK {
                 sqlite3_key(database, key, Int32(key.count))
                 _ = migrate()
+                self.dbInitialized = true
             } else {
                 let errMsg = database != nil ? String(cString: sqlite3_errmsg(database)) : "nil"
                 FireLog.statistics.error("init DB, open error: \(errMsg, privacy: .public)")

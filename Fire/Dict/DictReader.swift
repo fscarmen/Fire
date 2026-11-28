@@ -11,6 +11,11 @@ import Defaults
 final class DictReader {
     private var database: OpaquePointer?
     private var queryStatement: OpaquePointer?
+    // 绑定参数下标在 prepare 时算一次。原来每次按键都调用三次
+    // sqlite3_bind_parameter_index（会逐字符解析 SQL 参数名）。
+    private var likeIndex: Int32 = -1
+    private var rawIndex: Int32 = -1
+    private var offsetIndex: Int32 = -1
 
     func bind(database: OpaquePointer?) {
         self.database = database
@@ -21,6 +26,9 @@ final class DictReader {
             sqlite3_finalize(queryStatement)
             queryStatement = nil
         }
+        likeIndex = -1
+        rawIndex = -1
+        offsetIndex = -1
     }
 
     func prepare() {
@@ -31,6 +39,9 @@ final class DictReader {
         FireLog.dict.debug("SQL: \(sql.replacingOccurrences(of: "\n", with: " "))")
 #endif
         if sqlite3_prepare_v2(database, sql, -1, &queryStatement, nil) == SQLITE_OK {
+            likeIndex = sqlite3_bind_parameter_index(queryStatement, ":queryLike")
+            rawIndex = sqlite3_bind_parameter_index(queryStatement, ":queryRaw")
+            offsetIndex = sqlite3_bind_parameter_index(queryStatement, ":offset")
             FireLog.dict.debug("prepare ok")
         } else if let err = sqlite3_errmsg(database) {
             FireLog.dict.error("prepare fail: \(String(cString: err), privacy: .public)")
@@ -101,6 +112,8 @@ extension DictReader {
     }()
 
     private func replaceTextWithVars(_ text: String) -> String {
+        // 绝大多数用户词没有日期占位符，避免 6 次 replacingOccurrences + Date 格式化
+        guard text.contains("{") else { return text }
         let date = Date()
         let arr = DictReader.dateFormatter.string(from: date).split(separator: " ")
         let vars: [String: String] = [
@@ -158,20 +171,10 @@ extension DictReader {
         var candidates: [Candidate] = []
         sqlite3_reset(queryStatement)
         sqlite3_clear_bindings(queryStatement)
-        sqlite3_bind_text(queryStatement,
-                          sqlite3_bind_parameter_index(queryStatement, ":queryLike"),
-                          queryLike, -1,
-                          SQLITE_TRANSIENT
-        )
-        sqlite3_bind_text(queryStatement,
-                          sqlite3_bind_parameter_index(queryStatement, ":queryRaw"),
-                          query, -1,
-                          SQLITE_TRANSIENT
-        )
-        sqlite3_bind_int(queryStatement,
-                         sqlite3_bind_parameter_index(queryStatement, ":offset"),
-                         Int32((page - 1) * Defaults[.candidateCount])
-        )
+        sqlite3_bind_text(queryStatement, likeIndex, queryLike, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(queryStatement, rawIndex, query, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_int(queryStatement, offsetIndex,
+                         Int32((page - 1) * Defaults[.candidateCount]))
         #if DEBUG
         FireLog.dict.debug("query sql: \(String(cString: sqlite3_expanded_sql(self.queryStatement)))")
         #endif
